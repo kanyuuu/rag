@@ -69,8 +69,21 @@ if prompt := st.chat_input("请输入您关于政务服务的问题..."):
         message_placeholder.markdown("正在思考中... 🤔")
 
         try:
-            # 准备请求数据
-            payload = {"question": prompt}
+            # 清洗历史记录：只提取 role 和 content，去掉 frontend 特有的 sources 字段
+            # 同时避免把刚刚放进去的当前 prompt 也作为 history 传进去，所以取 st.session_state.messages[:-1]
+            history_payload = []
+            for msg in st.session_state.messages[:-1]: 
+                if msg["role"] in ["user", "assistant"]:
+                    history_payload.append({
+                        "role": msg["role"], 
+                        "content": msg["content"]
+                    })
+
+            # 准备请求数据，加入 history 字段
+            payload = {
+                "question": prompt,
+                "history": history_payload
+            }
             headers = {"Content-Type": "application/json"}
 
             # 发送POST请求

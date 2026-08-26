@@ -65,8 +65,13 @@ print("RAG系统初始化完成，准备好接收请求。")
 
 
 # --- 3. Pydantic 模型定义 ---
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
 class QueryRequest(BaseModel):
     question: str
+    history: List[ChatMessage] = []
 
 class SourceDocument(BaseModel):
     content: str
@@ -106,30 +111,41 @@ def rerank_documents(query: str, docs: list[Document], top_n: int = 3) -> list[D
         return docs[:top_n]  # 如果rerank失败，返回初始检索的前N个文档作为备用
 
 
-def generate_answer(query: str, context_docs: list[Document]) -> str:
-    """使用 SiliconFlow API 和重排后的文档生成答案"""
+def generate_answer(query: str, context_docs: list[Document], history: List[Dict[str, str]] = None) -> str:
+    """使用 SiliconFlow API 和重排后的文档生成多轮对话答案"""
+    if history is None:
+        history = []
+        
     context = "\n\n".join([doc.page_content for doc in context_docs])
 
-    prompt = f"""
-    根据以下提供的上下文信息，准确、详细地回答用户的问题。
-    如果上下文信息不足以回答，请明确说明“根据现有信息无法回答该问题”。
+    # 1. 构建 System Prompt，赋予角色并注入检索到的上下文
+    system_prompt = f"""你是一个专业的政务服务助手。
+请根据以下提供的上下文信息，准确、详细地回答用户的当前问题。
+如果上下文信息不足以回答，请明确说明“根据现有信息无法回答该问题”。
 
-    上下文信息:
-    ---
-    {context}
-    ---
+上下文信息:
+---
+{context}
+---"""
 
-    用户问题: {query}
-
-    回答:
-    """
+    # 2. 组装 messages 列表
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    # 3. 追加历史对话 (为了防止 token 超出限制，建议只保留最近的 3-5 轮对话)
+    # 假设我们保留最近的 6 条消息 (3轮交互)
+    for msg in history[-6:]:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+        
+    # 4. 追加当前用户的最新问题
+    messages.append({"role": "user", "content": query})
 
     payload = {
         "model": LLM_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "max_tokens": 1024,
-        "temperature": 0.1,
+        "temperature": 0.1, # 保持低温度以保证政务回答的准确性
     }
+    
     headers = {"Authorization": f"Bearer {SILICONFLOW_API_KEY}", "Content-Type": "application/json"}
 
     try:
@@ -142,7 +158,6 @@ def generate_answer(query: str, context_docs: list[Document]) -> str:
     except (KeyError, IndexError) as e:
         print(f"LLM API 响应格式错误: {e}, 响应内容: {response.text}")
         return "抱歉，解析大语言模型返回的答案时发生错误。"
-
 
 # --- 5. FastAPI 应用和 API 路由 ---
 app = FastAPI(title="RAG API", description="基于 FastAPI 的 RAG 问答系统")
@@ -173,7 +188,8 @@ async def rag_query(request: QueryRequest):
 
         # 步骤 3: 生成答案
         print("步骤 3: 正在调用LLM生成最终答案...")
-        answer = generate_answer(question, reranked_docs)
+        history_dicts = [{"role": msg.role, "content": msg.content} for msg in request.history]
+        answer = generate_answer(question, reranked_docs, history_dicts)
         print(f"  - LLM生成答案完成。")
 
         # 准备返回的源文档信息
