@@ -13,6 +13,11 @@ from typing import List, Dict, Any
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
+from langchain_classic.retrievers import ParentDocumentRetriever
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from typing import Sequence, Optional, Iterator, Tuple
+from langchain_core.stores import BaseStore
 
 # --- 1. 初始化和配置 ---
 print("正在初始化 FastAPI 应用和 RAG 系统...")
@@ -34,6 +39,45 @@ SILICONFLOW_API_KEY = os.getenv("SILICONFLOW_API_KEY")
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 LLM_MODEL = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"  # 使用一个高效的指令模型
 SILICONFLOW_API_BASE = "https://api.siliconflow.cn/v1"
+
+class SimpleLocalDocStore(BaseStore[str, Document]):
+    """自定义本地文档存储，绕过 Langchain 环境坑，直接以 JSON 格式持久化父文档"""
+    def __init__(self, path: str):
+        self.path = path
+        os.makedirs(path, exist_ok=True)
+        
+    def mget(self, keys: Sequence[str]) -> list[Optional[Document]]:
+        docs = []
+        for key in keys:
+            file_path = os.path.join(self.path, f"{key}.json")
+            if os.path.exists(file_path):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    docs.append(Document(page_content=data['page_content'], metadata=data.get('metadata', {})))
+            else:
+                docs.append(None)
+        return docs
+        
+    def mset(self, key_value_pairs: Sequence[Tuple[str, Document]]) -> None:
+        for key, doc in key_value_pairs:
+            file_path = os.path.join(self.path, f"{key}.json")
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump({'page_content': doc.page_content, 'metadata': doc.metadata}, f, ensure_ascii=False)
+                
+    def mdelete(self, keys: Sequence[str]) -> None:
+        for key in keys:
+            file_path = os.path.join(self.path, f"{key}.json")
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+    def yield_keys(self, prefix: Optional[str] = None) -> Iterator[str]:
+        if not os.path.exists(self.path):
+            return
+        for filename in os.listdir(self.path):
+            if filename.endswith(".json"):
+                key = filename[:-5]
+                if prefix is None or key.startswith(prefix):
+                    yield key
 
 # --- 2. 加载模型和数据 (在应用启动时执行一次) ---
 # 检查API密钥
@@ -60,8 +104,22 @@ faiss_db = FAISS.load_local(
 )
 
 # 创建检索器
-retriever = faiss_db.as_retriever(search_kwargs={"k": 10})  # 初始检索10个文档
-print("RAG系统初始化完成，准备好接收请求。")
+# 加载用于存放父文档的本地存储
+PARENT_STORE_PATH = "./parent_docs_store"
+store = SimpleLocalDocStore(PARENT_STORE_PATH)
+
+parent_splitter = RecursiveCharacterTextSplitter(chunk_size=800)
+child_splitter = RecursiveCharacterTextSplitter(chunk_size=200)
+
+# 重建 ParentDocumentRetriever
+retriever = ParentDocumentRetriever(
+    vectorstore=faiss_db,
+    docstore=store,
+    child_splitter=child_splitter, # 检索阶段不需要重新切分
+    parent_splitter=parent_splitter,
+    search_kwargs={"k": 10} # 检索10个子块，进而映射回它们所属的父块
+)
+print("父子块 RAG 系统初始化完成，准备好接收请求。")
 
 
 # --- 3. Pydantic 模型定义 ---
