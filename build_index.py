@@ -5,8 +5,9 @@ import torch
 import json
 import faiss
 from dotenv import load_dotenv
-
-# --- 更新后的导包 ---
+import pickle
+import jieba
+from langchain_community.retrievers import BM25Retriever
 from langchain_community.document_loaders import PDFPlumberLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_classic.retrievers import ParentDocumentRetriever
@@ -33,6 +34,9 @@ CHILD_CHUNK_SIZE = 200
 PARENT_STORE_PATH = "./parent_docs_store"  
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+def jieba_tokenize(text: str):
+    return jieba.lcut(text)
 
 class SimpleLocalDocStore(BaseStore[str, Document]):
     """自定义本地文档存储，绕过 Langchain 环境坑，直接以 JSON 格式持久化父文档"""
@@ -104,12 +108,25 @@ def create_parent_child_index(pdf_path: str, embeddings_model, db_path: str, sto
         parent_splitter=parent_splitter,
     )
 
-    print("正在进行父子块切分并存入数据库 (这可能需要一些时间)...")
-    retriever.add_documents(documents)
-
+    # 6. 保存子文档 FAISS 向量库
     vectorstore.save_local(db_path)
     print(f"子文档 FAISS 向量库已保存至: {db_path}")
     print(f"父文档文本已自动持久化至: {store_path}")
+
+    # --- 构建并保存 BM25 索引 ---
+    print("正在基于父文档构建 BM25 关键词索引...")
+    parent_docs = []
+    for key in store.yield_keys():
+        doc_list = store.mget([key])
+        if doc_list and doc_list[0]:
+            parent_docs.append(doc_list[0])
+
+    if parent_docs:
+        bm25_retriever = BM25Retriever.from_documents(parent_docs, preprocess_func=jieba_tokenize)
+        bm25_retriever.k = 5  # 设置 BM25 默认召回数量
+        with open("./bm25_index.pkl", "wb") as f:
+            pickle.dump(bm25_retriever, f)
+        print("BM25 索引已成功保存至 ./bm25_index.pkl")
 
 def get_embeddings_model(model_name_or_path: str) -> HuggingFaceEmbeddings:
     print(f"正在加载嵌入模型: {model_name_or_path} (device: {DEVICE})")
